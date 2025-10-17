@@ -5,6 +5,7 @@ import styles from "./Selfie.module.scss";
 import { apiImageUpload } from "@/utils/api";
 import type { IImageDoc } from "@/types";
 import { showErrorToast } from '@/utils/toast';
+import { useCrop } from '@/hooks/useCrop';
 
 type Props = {
     onUploaded?: (image: IImageDoc) => void; // parent can update the grid/selection
@@ -30,6 +31,13 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
     const [videoLoaded, setVideoLoaded] = useState(false);
     const [isMirrored, setIsMirrored] = useState(true); // Default to mirrored (like a real mirror)
 
+    // Use the crop hook
+    const crop = useCrop({
+        onCropComplete: (croppedImageUrl: string) => {
+            setCapturedImage(croppedImageUrl);
+        }
+    });
+
     const handleOpenModal = useCallback(() => {
         setIsModalOpen(true);
     }, []);
@@ -46,7 +54,8 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
         setVideoLoaded(false);
         setError(null);
         setIsMirrored(true); // Reset to default mirrored state
-    }, []);
+        crop.resetCrop();
+    }, [crop]);
 
     const startCamera = useCallback(async () => {
         try {
@@ -120,31 +129,35 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
         // Restore the context state
         context.restore();
 
-        // Convert canvas to blob
+        // Convert canvas to blob and start cropping
         canvas.toBlob((blob) => {
             if (blob) {
                 console.log('Photo captured, blob size:', blob.size);
                 const imageUrl = URL.createObjectURL(blob);
                 setCapturedImage(imageUrl);
 
-                // Stop camera stream but don't reset captured image
+                // Start cropping with the captured image
+                crop.startCropping(canvasRef);
+
+                // Stop camera stream and enter cropping mode
                 if (streamRef.current) {
                     streamRef.current.getTracks().forEach(track => track.stop());
                     streamRef.current = null;
                 }
                 setIsCameraOpen(false);
                 setVideoLoaded(false);
-                console.log('Photo captured and camera stopped');
+                console.log('Photo captured, entering crop mode');
             } else {
                 console.error('❌ Failed to create blob from canvas');
             }
         }, 'image/jpeg', 0.8);
-    }, [isMirrored]);
+    }, [isMirrored, crop]);
 
     const retakePhoto = useCallback(() => {
         setCapturedImage(null);
+        crop.resetCrop();
         startCamera();
-    }, [startCamera]);
+    }, [startCamera, crop]);
 
     const toggleMirror = useCallback(() => {
         setIsMirrored(prev => !prev);
@@ -164,16 +177,33 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
 
     const uploadPhoto = useCallback(async () => {
         console.log('Starting photo upload...');
-        if (!canvasRef.current) {
-            console.error('❌ Canvas ref not available for upload');
+
+        // Use crop canvas ONLY if it has valid dimensions AND we're not in cropping mode
+        // This ensures we don't use a stale or empty crop canvas
+        const canvasToUse = !crop.isCropping && crop.cropCanvasRef.current && crop.cropCanvasRef.current.width > 0 && crop.cropCanvasRef.current.height > 0
+            ? crop.cropCanvasRef.current
+            : canvasRef.current;
+
+        if (!canvasToUse) {
+            console.error('❌ No canvas available for upload');
             return;
         }
+
+        console.log('Using canvas for upload:', {
+            isCropping: crop.isCropping,
+            cropCanvasExists: !!crop.cropCanvasRef.current,
+            cropCanvasWidth: crop.cropCanvasRef.current?.width || 0,
+            cropCanvasHeight: crop.cropCanvasRef.current?.height || 0,
+            originalCanvasWidth: canvasRef.current?.width || 0,
+            originalCanvasHeight: canvasRef.current?.height || 0,
+            usingCropCanvas: canvasToUse === crop.cropCanvasRef.current
+        });
 
         setBusy(true);
         try {
             // Convert canvas to file
             const blob = await new Promise<Blob>((resolve) => {
-                canvasRef.current!.toBlob((blob) => {
+                canvasToUse!.toBlob((blob: Blob | null) => {
                     resolve(blob!);
                 }, 'image/jpeg', 0.8);
             });
@@ -211,7 +241,7 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
         } finally {
             setBusy(false);
         }
-    }, [fileSizeMax, onUploaded]);
+    }, [fileSizeMax, onUploaded, handleCloseModal, crop]);
 
     const buttonStyle: React.CSSProperties = {};
     if (width) {
@@ -261,6 +291,21 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
         }
     }, [isModalOpen, isCameraOpen, capturedImage, startCamera]);
 
+    // Add mouse event listeners for crop dragging
+    React.useEffect(() => {
+        if (crop.isCropping) {
+            const handleMouseMoveWrapper = (e: MouseEvent) => crop.handleMouseMove(e, canvasRef);
+
+            document.addEventListener('mousemove', handleMouseMoveWrapper);
+            document.addEventListener('mouseup', crop.handleMouseUp);
+
+            return () => {
+                document.removeEventListener('mousemove', handleMouseMoveWrapper);
+                document.removeEventListener('mouseup', crop.handleMouseUp);
+            };
+        }
+    }, [crop.isCropping, crop.handleMouseMove, crop.handleMouseUp, crop, canvasRef]);
+
     // Handle escape key to close modal
     useEffect(() => {
         const handleEscape = (event: KeyboardEvent) => {
@@ -282,7 +327,16 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
     }, [isModalOpen, handleCloseModal]);
 
     // Debug logging
-    console.log('🔍 Component state:', { isModalOpen, isCameraOpen, videoLoaded, capturedImage, busy, error });
+    console.log('🔍 Component state:', {
+        isModalOpen,
+        isCameraOpen,
+        videoLoaded,
+        capturedImage,
+        busy,
+        error,
+        isCropping: crop.isCropping,
+        hasCroppedImage: crop.hasCroppedImage
+    });
 
     return (
         <>
@@ -321,6 +375,7 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
                         {/* Modal Body */}
                         <div className={styles["selfie__modal-body"]}>
                             <canvas ref={canvasRef} style={{ display: 'none' }} />
+                            <canvas ref={crop.cropCanvasRef} style={{ display: 'none' }} />
 
                             {!capturedImage ? (
                                 <div className={styles["selfie__camera"]}>
@@ -372,13 +427,84 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
                                         </button>
                                     </div>
                                 </div>
+                            ) : crop.isCropping ? (
+                                <div className={styles["selfie__crop"]}>
+                                    <div className={styles["selfie__crop-container"]} ref={crop.cropContainerRef}>
+                                        <img
+                                            src={capturedImage}
+                                            alt="Captured selfie for cropping"
+                                            className={styles["selfie__crop-image"]}
+                                            onLoad={(e) => {
+                                                const img = e.target as HTMLImageElement;
+                                                const rect = img.getBoundingClientRect();
+                                                console.log('Crop image loaded:', { width: rect.width, height: rect.height });
+                                            }}
+                                        />
+                                        <div
+                                            className={styles["selfie__crop-overlay"]}
+                                            style={{
+                                                left: `${(crop.cropData.x / (canvasRef.current?.width || 1)) * 100}%`,
+                                                top: `${(crop.cropData.y / (canvasRef.current?.height || 1)) * 100}%`,
+                                                width: `${(crop.cropData.width / (canvasRef.current?.width || 1)) * 100}%`,
+                                                height: `${(crop.cropData.height / (canvasRef.current?.height || 1)) * 100}%`,
+                                            }}
+                                            onMouseDown={crop.handleCropMouseDown}
+                                        >
+                                            <div
+                                                className={styles["selfie__crop-handle"]}
+                                                data-handle="nw"
+                                                onMouseDown={(e) => crop.handleCropHandleMouseDown(e, 'nw')}
+                                            ></div>
+                                            <div
+                                                className={styles["selfie__crop-handle"]}
+                                                data-handle="ne"
+                                                onMouseDown={(e) => crop.handleCropHandleMouseDown(e, 'ne')}
+                                            ></div>
+                                            <div
+                                                className={styles["selfie__crop-handle"]}
+                                                data-handle="sw"
+                                                onMouseDown={(e) => crop.handleCropHandleMouseDown(e, 'sw')}
+                                            ></div>
+                                            <div
+                                                className={styles["selfie__crop-handle"]}
+                                                data-handle="se"
+                                                onMouseDown={(e) => crop.handleCropHandleMouseDown(e, 'se')}
+                                            ></div>
+                                        </div>
+                                    </div>
+                                    <div className={styles["selfie__crop-actions"]}>
+                                        <button
+                                            type="button"
+                                            className={styles["selfie__apply-crop"]}
+                                            onClick={() => crop.applyCrop(canvasRef, capturedImage)}
+                                        >
+                                            ✂️ Apply Crop
+                                        </button>
+                                        <button
+                                            type="button"
+                                            className={styles["selfie__cancel-crop"]}
+                                            onClick={() => crop.cancelCrop(canvasRef)}
+                                        >
+                                            ❌ Cancel Crop
+                                        </button>
+                                        <button
+                                            type="button"
+                                            className={styles["selfie__retake"]}
+                                            onClick={retakePhoto}
+                                        >
+                                            🔄 Retake
+                                        </button>
+                                    </div>
+                                </div>
                             ) : (
                                 <div className={styles["selfie__preview"]}>
-                                    <img
-                                        src={capturedImage}
-                                        alt="Captured selfie"
-                                        className={styles["selfie__image"]}
-                                    />
+                                    <div className={styles["selfie__image-container"]}>
+                                        <img
+                                            src={capturedImage}
+                                            alt="Captured selfie"
+                                            className={styles["selfie__image"]}
+                                        />
+                                    </div>
                                     <div className={styles["selfie__actions"]}>
                                         <button
                                             type="button"
@@ -388,6 +514,16 @@ const Selfie: React.FC<Props> = ({ onUploaded, fileSizeMax, width, maxWidth, but
                                         >
                                             {busy ? "Uploading…" : "Upload Photo"}
                                         </button>
+                                        {!crop.hasCroppedImage && (
+                                            <button
+                                                type="button"
+                                                className={styles["selfie__crop-button"]}
+                                                onClick={() => crop.startCropping(canvasRef)}
+                                                disabled={busy}
+                                            >
+                                                ✂️ Crop
+                                            </button>
+                                        )}
                                         <button
                                             type="button"
                                             className={styles["selfie__retake"]}
